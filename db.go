@@ -1,9 +1,8 @@
 package main
 
 import (
-	"time"
-
 	"github.com/rhinoman/couchdb-go"
+	"time"
 )
 
 var conn *couchdb.Connection
@@ -11,13 +10,13 @@ var conn *couchdb.Connection
 func createDB() *couchdb.Database {
 	var err error
 	if conn == nil {
-		var timeout = time.Duration(10 * time.Second)
-		conn, err = couchdb.NewConnection("127.0.0.1", 5984, timeout)
+		var timeout = 10 * time.Second
+		conn, err = couchdb.NewConnection("0.0.0.0", 5984, timeout)
 	}
 	if err != nil {
 		panic(err)
 	}
-	auth := couchdb.BasicAuth{Username: "pinta", Password: "developer1"}
+	auth := couchdb.BasicAuth{Username: "ginta", Password: "12345"}
 	conn.CreateDB("mydb", &auth)
 	return conn.SelectDB("mydb", &auth)
 }

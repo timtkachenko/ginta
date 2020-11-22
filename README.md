@@ -1,1 +1,3 @@
-# ginta is like pinta but in Go
+# ginta
+
+golang udp packet receiver with couchdb as a store

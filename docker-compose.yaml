@@ -1,0 +1,12 @@
+version: '3'
+services:
+  db:
+    image: couchdb
+    ports:
+      - 5984:5984/tcp
+    environment:
+      COUCHDB_USER: ginta
+      COUCHDB_PASSWORD: 12345
+    network_mode: bridge
+    volumes:
+      - ./couchdb/data:/opt/couchdb/data

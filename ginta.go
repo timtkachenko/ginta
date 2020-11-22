@@ -1,162 +1,124 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
+	"github.com/libp2p/go-reuseport"
+	"log"
 	"net"
+	"os"
+	"os/signal"
+	"runtime"
+	"sync"
+	"syscall"
 	"time"
-
-	"github.com/satori/go.uuid"
 )
 
-type Parsed struct {
-	//	id     string
-	//	data string
-	Number int
-	//	count  int
+const PORT = 22111
+const maxQueueSize = 1000
+
+type OutgoingMessage struct {
+	recipient *net.UDPAddr
+	data      []byte
 }
 
-var queue []string
-var in chan string = make(chan string)
-var db = createDB()
-var res chan int = make(chan int)
-
-func worker(id int, jobs <-chan []string) {
-	for {
-		chunk := <-jobs
-		if len(chunk) > 0 {
-			fmt.Println("worker", id, "started  job", chunk[0], "-", chunk[len(chunk)-1])
-			//			res <- len(chunk)
-			receive(chunk)
-			fmt.Println("worker", id, "finished job", chunk[0], "-", chunk[len(chunk)-1])
-		}
-	}
-}
+var sCounter counterSync
 
 func main() {
-	sAddr, err := net.ResolveUDPAddr("udp", ":22111")
+	log.Println("Starting...")
+
+	maxListeners := runtime.NumCPU() / 2
+	runtime.GOMAXPROCS(maxListeners)
+	fmt.Printf("maxListeners: %d\n", maxListeners)
+
+	go stats()
+	go process()
+	quit := make(chan os.Signal, 1)
+	for i := 0; i < maxListeners; i++ {
+		go beginListen(quit)
+	}
+	signal.Notify(quit, syscall.SIGHUP,
+		syscall.SIGINT,
+		syscall.SIGTERM,
+		syscall.SIGQUIT)
+	<-quit
+	time.Sleep(time.Second * 2)
+	log.Println("Shutdown ...")
+}
+
+func beginListen(c chan os.Signal) {
+	addr := net.UDPAddr{
+		Port: PORT,
+		IP:   net.IP{0, 0, 0, 0},
+	}
+
+	connection, err := reuseport.ListenPacket("udp", addr.String())
 	if err != nil {
-		fmt.Println("Error: ", err)
+		panic(err)
 	}
-	sConn, err := net.ListenUDP("udp", sAddr)
-	sConn.SetReadBuffer(212992)
-	if err != nil {
-		fmt.Println("Error: ", err)
-	}
-	defer sConn.Close()
+	defer connection.Close()
 
-	buf := make([]byte, 8192)
-	jobs := make(chan []string, 100)
+	outbox := make(chan OutgoingMessage, maxQueueSize)
 
-	go accum(in)
-	for w := 1; w <= 4; w++ {
-		go worker(w, jobs)
-	}
-	go consume(jobs)
-
-	go func() {
-		ticker := time.NewTicker(time.Millisecond * 3000)
-		var i int = 0
-		for {
-			select {
-			case <-ticker.C:
-				fmt.Println("res: ", i)
-				fmt.Println("cc: ", cc)
-				cc = 0
-				i = 0
-				break
-			case c := <-res:
-				i += c
-				break
+	sendFromOutbox := func() {
+		n, err := 0, error(nil)
+		for msg := range outbox {
+			n, err = connection.(*net.UDPConn).WriteToUDP(msg.data, msg.recipient)
+			if err != nil {
+				log.Println(err)
 			}
-
+			if n != len(msg.data) {
+				log.Println("Tried to send", len(msg.data), "bytes but only sent ", n)
+			}
 		}
-	}()
-	for {
-		n, err := sConn.Read(buf)
-		in <- string(buf[0:n])
+	}
 
+	for i := 1; i <= 4; i++ {
+		go sendFromOutbox()
+	}
+
+	listen(connection.(*net.UDPConn), c, outbox)
+
+	close(outbox)
+}
+
+func listen(udpConn *net.UDPConn, c chan os.Signal, outbox chan OutgoingMessage) {
+	for {
+		buf := make([]byte, 8192)
+		n, addr, err := udpConn.ReadFromUDP(buf)
 		if err != nil {
 			fmt.Println("Error: ", err)
 		}
+		msg := buf[0:n]
+		sCounter.Incr()
+		qStore.Set(msg)
+		outbox <- OutgoingMessage{
+			recipient: addr,
+			data:      msg,
+		}
 	}
 
 }
-
-var cc int
-
-func accum(in chan string) {
+func stats() {
+	sCounter = counterSync{
+		mx:    &sync.RWMutex{},
+		store: 0,
+	}
+	var history int
+	passed := 1
 	for {
-		queue = append(queue, <-in)
-		cc++
-	}
-}
-
-func consume(jobs chan []string) {
-	ticker := time.NewTicker(time.Millisecond * 100)
-	for {
-		//		select {
-		//		case <-ticker.C:
-		<-ticker.C
-
-		//		fmt.Println("Tick at", t)
-		queueCopy := queue[:len(queue)]
-		curQueueLength := len(queueCopy)
-		res <- len(queue)
-		if curQueueLength > 0 {
-			//			fmt.Printf("actual queue %v\n", len(queue))
-			queue = queue[curQueueLength:]
-
-			chunkSize := curQueueLength / 2
-			chunk := queueCopy[0:chunkSize]
-			chunk2 := queueCopy[chunkSize:curQueueLength]
-			jobs <- chunk
-			jobs <- chunk2
-			//			fmt.Printf("curQueueLength %v\n", curQueueLength)
-			//			fmt.Printf("chunk %v\n", len(chunk))
-			//			fmt.Printf("chunk2 %v\n", len(chunk2))
+		select {
+		case <-time.After(time.Second):
+			fmt.Printf("processed: %d\n", sCounter.Get())
+			passed++
+			if passed > 5 && history == sCounter.Get() {
+				sCounter.Reset()
+				passed = 0
+			} else if passed > 5 {
+				history = sCounter.Get()
+				passed = 0
+			}
+			break
 		}
 
-		//		fmt.Println("tick\n")
-		//		case res := <-results:
-		//			fmt.Println("result: ", res)
-		//		default:
-		//			//			fmt.Println("no message received")
-
-		//			if count != 0 && len(queue) == 0 && !reported {
-		//				reported = true
-		//				count = 0
-		//				fmt.Printf("count == %v\n", count)
-		//			}
-		//		}
 	}
-}
-
-func receive(chunk []string) {
-	bulkDoc := db.NewBulkDocument()
-
-	for _, data := range chunk {
-
-		var doc Parsed
-
-		if err := json.Unmarshal([]byte(data), &doc); err != nil {
-			fmt.Println("data: ", data)
-			panic(err)
-		}
-		//		time.Sleep(time.Second)
-		err := bulkDoc.Save(doc, uuid.NewV4().String(), "")
-
-		//		results <- rev + " - " + chunk[0]
-		if err != nil {
-			fmt.Println("Error: ", err)
-		}
-	}
-	//	if len(chunk) > 0 {
-	//		fmt.Printf("%v - %v\n", chunk[0], chunk[len(chunk)-1])
-	//	}
-	_, err := bulkDoc.Commit()
-	if err != nil {
-		fmt.Println("Error: ", err)
-	}
-	//	fmt.Printf("bulk res: %v\n", res)
 }
